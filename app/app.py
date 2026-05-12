@@ -19,6 +19,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from ann_model import (
+    lookup_weather,
+    load_weather,
+    train_ann,
+)
 from data_utils import borough_to_nta_map, historical_hourly_mean, load_hourly_data
 from model import build_features, train_linear_regression
 
@@ -101,9 +106,27 @@ def _train_model(_df: pd.DataFrame):
     return train_linear_regression(_df)
 
 
+@st.cache_data(show_spinner="Loading 2025 hourly weather data…")
+def _load_weather():
+    return load_weather()
+
+
+@st.cache_resource(show_spinner="Training ANN (no weather, pure NumPy)…")
+def _train_ann_no_weather(_df: pd.DataFrame):
+    return train_ann(_df, include_weather=False)
+
+
+@st.cache_resource(show_spinner="Training ANN with weather features (pure NumPy)…")
+def _train_ann_weather(_df: pd.DataFrame, _weather: pd.DataFrame):
+    return train_ann(_df, include_weather=True, weather_df=_weather)
+
+
 df = _load_data()
-model, metrics = _train_model(df)
+weather_df = _load_weather()
 boro_lookup = borough_to_nta_map(df)
+# Linear-regression baseline is kept available in `model.py` for offline
+# experiments but isn't surfaced in the UI — the app picks between the two
+# ANNs based on whether the user provides weather inputs.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,12 +160,58 @@ with st.sidebar:
     hour_choice = st.slider("Hour of Day", min_value=0, max_value=23, value=8)
 
     st.markdown("---")
-    st.markdown("#### Model")
-    st.markdown(
-        "**Multiple Linear Regression**  \n"
-        "Trained from scratch with NumPy using the closed-form Normal Equation."
+    st.markdown("#### Weather Conditions  *(optional)*")
+
+    # If the user supplies weather, route to the weather-aware ANN.
+    # Otherwise predict with the lighter no-weather ANN.
+    use_weather = st.toggle(
+        "Use weather in the prediction",
+        value=False,
+        help=(
+            "Off: predict using only time + location (ANN, no weather). "
+            "On: the model also accounts for the weather inputs below."
+        ),
+        disabled=(weather_df is None),
     )
-    st.caption("ANN model integration coming in the next milestone.")
+
+    # Pre-fill weather inputs with the actual recorded values for the chosen
+    # (date, hour). The user can either accept them or tweak them to explore
+    # "what if it rains harder?" type scenarios.
+    if weather_df is not None:
+        actual_when = pd.Timestamp(
+            year=date_choice.year, month=date_choice.month,
+            day=date_choice.day, hour=hour_choice,
+        )
+        actual_weather = lookup_weather(weather_df, actual_when)
+    else:
+        actual_weather = {}
+
+    if use_weather:
+        # Temperature, precipitation, humidity, wind speed and cloud cover are
+        # auto-filled from the actual 2025 weather record for the chosen hour.
+        # The user only picks the weather condition.
+        condition_options = [
+            "Clear", "Fair", "Cloudy", "Fog",
+            "Light Rain", "Rain", "Heavy Rain", "Rain Shower", "Heavy Rain Shower",
+            "Light Snowfall", "Snowfall", "Heavy Snowfall", "Snow Shower",
+            "Sleet", "Heavy Sleet",
+        ]
+        actual_cond = actual_weather.get("weather_condition", "Cloudy")
+        default_idx = condition_options.index(actual_cond) if actual_cond in condition_options else 2
+        condition_in = st.selectbox(
+            "Weather condition",
+            options=condition_options,
+            index=default_idx,
+        )
+        st.caption(
+            "Temperature, precipitation, humidity, wind speed, and cloud cover are read "
+            "from the actual 2025 weather record for the selected date and hour."
+        )
+    else:
+        if weather_df is None:
+            st.caption("Weather data unavailable — predictions use the no-weather ANN.")
+        else:
+            st.caption("Toggle on to enter a weather condition and switch to the weather-aware model.")
 
     predict_clicked = st.button("⚡  Predict Demand", use_container_width=True, type="primary")
 
@@ -156,19 +225,36 @@ dow = date_choice.weekday()          # Monday=0 ... Sunday=6
 month = date_choice.month
 is_weekend = dow >= 5
 
-input_row = pd.DataFrame(
-    [{
-        "NTA2020": nta_code,
-        "BoroName": boro_choice,
-        "hour": hour_choice,
-        "dow": dow,
-        "month": month,
-        "is_weekend": is_weekend,
-    }]
-)
-features = build_features(input_row, model.nta_vocabulary, model.boro_vocabulary)
-features = features[model.feature_columns]          # enforce column order
-predicted_rides = max(0.0, model.predict_from_row(features))
+base_row = {
+    "NTA2020": nta_code,
+    "BoroName": boro_choice,
+    "hour": hour_choice,
+    "dow": dow,
+    "month": month,
+    "is_weekend": is_weekend,
+}
+
+# The presence (or absence) of user-supplied weather decides which model runs.
+# Weather toggle ON  -> ANN with weather, fed the user's slider values.
+# Weather toggle OFF -> ANN without weather, time + location only.
+if use_weather and weather_df is not None:
+    ann_w, ann_w_metrics = _train_ann_weather(df, weather_df)
+    active_metrics = ann_w_metrics
+    # Numeric weather features come from the recorded 2025 weather for this
+    # hour. The user only overrides the weather condition via the dropdown.
+    weather_inputs = {
+        k: v for k, v in actual_weather.items() if k != "weather_condition"
+    }
+    weather_inputs["weather_condition"] = condition_in
+    input_row = pd.DataFrame([{**base_row, **weather_inputs}])
+    predicted_rides = ann_w.predict_from_row(input_row)
+    active_model_label = "ANN — temporal + spatial + weather features"
+else:
+    ann_no_w, ann_no_w_metrics = _train_ann_no_weather(df)
+    active_metrics = ann_no_w_metrics
+    input_row = pd.DataFrame([base_row])
+    predicted_rides = ann_no_w.predict_from_row(input_row)
+    active_model_label = "ANN — temporal + spatial features (no weather)"
 
 # Historical comparisons for context tiles.
 hist_by_hour = historical_hourly_mean(df, nta_code, month)
@@ -269,16 +355,19 @@ with left:
     st.pyplot(fig, clear_figure=True)
 
 with right:
-    st.markdown("##### Model performance (validation set)")
-    val_m = metrics["val"]
-    test_m = metrics["test"]
-    st.metric("RMSE", f"{val_m['RMSE']:.2f}", help="Root mean squared error on held-out validation set (Sep–early Nov 2025)")
-    st.metric("MAE", f"{val_m['MAE']:.2f}", help="Mean absolute error on held-out validation set")
-    st.metric("R²", f"{val_m['R2']:.3f}", help="Proportion of variance explained on held-out validation set")
+    st.markdown(f"##### Model performance — {active_model_label}")
+    val_m = active_metrics["val"]
+    test_m = active_metrics["test"]
+    st.metric("Val RMSE", f"{val_m['RMSE']:.2f}",
+              help="Root mean squared error on held-out validation set (Sep–early Nov 2025)")
+    st.metric("Val MAE", f"{val_m['MAE']:.2f}",
+              help="Mean absolute error on held-out validation set")
+    st.metric("Val R²", f"{val_m['R2']:.3f}",
+              help="Proportion of variance explained on held-out validation set")
     st.caption(
-        f"Test RMSE rises to {test_m['RMSE']:.0f} on the Nov–Dec holdout because the "
-        "baseline has no weather features; integrating weather is the next milestone. "
-        "Chronological 70/15/15 split on 2025 hourly data."
+        f"Test: RMSE {test_m['RMSE']:.0f}  ·  MAE {test_m['MAE']:.0f}  ·  R² {test_m['R2']:.3f}  \n"
+        "Chronological 70 / 15 / 15 split on 2025 hourly data. "
+        "Use the sidebar to compare models side-by-side."
     )
 
 
@@ -293,25 +382,33 @@ with st.expander("About this model"):
 so operators can anticipate demand hotspots and plan bike rebalancing.
 
 **Data.** Hourly aggregated Citi Bike trips across Manhattan and Brooklyn for
-calendar year 2025 (source: `hourly_neighborhood_2025.csv`).
+calendar year 2025 (`hourly_neighborhood_2025.csv`), joined with hourly NYC
+weather (`weather_knyc_2025.csv`) when the weather toggle is on.
 
-**Features.**
-- Cyclical encoding of hour-of-day and day-of-week (sin/cos pairs)
-- Raw month, is_weekend flag
-- One-hot encoded NTA2020 and BoroName
+**Two model variants, automatically selected by the sidebar toggle.**
+- **ANN (no weather)** — feed-forward net, one hidden layer (64 units) + ReLU,
+  MSE loss, mini-batch SGD with early stopping. Inputs: time and location only.
+  Active when the **Use weather in the prediction** toggle is *off*.
+- **ANN (+ weather)** — same architecture, plus the weather inputs you set in
+  the sidebar (`temp`, `prcp`, `rhum`, `wspd`, `cldc`) and a one-hot
+  `weather_condition`. Active when the toggle is *on*. Defaults reflect the
+  actual 2025 weather for the selected hour, so you can also explore "what if
+  it rained 10 mm/hr at 5 pm?" scenarios.
+
+A multiple-linear-regression baseline is also implemented in `model.py` for
+offline benchmarking, but the front-end only exposes the two ANN variants.
+
+**Shared features.** Cyclical encoding of hour-of-day, day-of-week, and month
+(sin/cos pairs); `is_weekend` flag; one-hot encoded `NTA2020` and `BoroName`.
 
 **Target.** `ride_count`, `log1p`-transformed to stabilize training against a
 heavy right-skewed distribution; predictions are inverted with `expm1`.
 
-**Training.** Pure NumPy multiple linear regression solved in closed form via
-the Normal Equation, `W = pinv(XᵀX) Xᵀy`. Features are standardized using
-training-set mean/std only.
+**Training.** Pure NumPy — no scikit-learn, XGBoost, TensorFlow, or PyTorch —
+per the project's from-scratch constraint. Numeric features are standardized
+using train-set mean/std only.
 
-**Split.** Chronological 70/15/15 on unique hourly timestamps — no random
+**Split.** Chronological 70 / 15 / 15 on unique hourly timestamps — no random
 shuffling, to respect temporal ordering.
-
-**Next steps.** Add the NumPy ANN from `ann_demand_prediction.ipynb`,
-integrate weather features from `weather_knyc_2025.csv`, and expose a
-side-by-side model comparison view.
 """
     )
