@@ -15,6 +15,7 @@ match what's reported in the team's experiments.
 from __future__ import annotations
 
 import os
+import pickle
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -489,3 +490,30 @@ def lookup_weather(weather_df: pd.DataFrame, when: pd.Timestamp) -> Dict[str, fl
         if c in row and pd.notna(row[c]):
             out[c] = row[c]
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Disk cache for trained models
+# ─────────────────────────────────────────────────────────────────────────────
+# Used by the deployed app to skip retraining on cold container starts. Local
+# development still trains live whenever the pickle files are absent.
+
+def cache_path_for(name: str) -> str:
+    """Return the on-disk pickle path for a named model variant."""
+    return os.path.join(_project_root(), "app", "cache", f"{name}.pkl")
+
+
+def save_trained(
+    trained: Tuple["ANNModel", Dict[str, Dict[str, float]]],
+    path: str,
+) -> None:
+    """Pickle (model, metrics) to disk."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(trained, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_trained(path: str) -> Tuple["ANNModel", Dict[str, Dict[str, float]]]:
+    """Load a previously pickled (model, metrics) tuple from disk."""
+    with open(path, "rb") as f:
+        return pickle.load(f)

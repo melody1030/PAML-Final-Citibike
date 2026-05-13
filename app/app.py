@@ -13,6 +13,7 @@ Run locally:
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,8 +21,10 @@ import pandas as pd
 import streamlit as st
 
 from ann_model import (
-    lookup_weather,
+    cache_path_for,
+    load_trained,
     load_weather,
+    lookup_weather,
     train_ann,
 )
 from data_utils import borough_to_nta_map, historical_hourly_mean, load_hourly_data
@@ -111,14 +114,29 @@ def _load_weather():
     return load_weather()
 
 
-@st.cache_resource(show_spinner="Training ANN (no weather, pure NumPy)…")
+@st.cache_resource(show_spinner="Loading ANN (no weather)…")
 def _train_ann_no_weather(_df: pd.DataFrame):
-    return train_ann(_df, include_weather=False)
+    """Load the pickled no-weather ANN if present; otherwise train it live.
+
+    Running `python app/warm_cache.py` once before deploy produces
+    `app/cache/ann_no_weather.pkl`, which makes this function return in
+    milliseconds. Without the pickle, training runs in ~35 s with a spinner.
+    """
+    pkl = cache_path_for("ann_no_weather")
+    if os.path.exists(pkl):
+        return load_trained(pkl)
+    with st.spinner("Training ANN (no weather, pure NumPy)…"):
+        return train_ann(_df, include_weather=False)
 
 
-@st.cache_resource(show_spinner="Training ANN with weather features (pure NumPy)…")
+@st.cache_resource(show_spinner="Loading ANN (+ weather)…")
 def _train_ann_weather(_df: pd.DataFrame, _weather: pd.DataFrame):
-    return train_ann(_df, include_weather=True, weather_df=_weather)
+    """Same disk-cache pattern as the no-weather variant."""
+    pkl = cache_path_for("ann_weather")
+    if os.path.exists(pkl):
+        return load_trained(pkl)
+    with st.spinner("Training ANN with weather features (pure NumPy)…"):
+        return train_ann(_df, include_weather=True, weather_df=_weather)
 
 
 df = _load_data()
